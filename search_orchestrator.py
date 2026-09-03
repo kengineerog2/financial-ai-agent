@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import feedparser
 from openai import OpenAI
@@ -14,7 +15,7 @@ opencode_client = OpenAI(
     api_key=os.getenv("OPENCODE_API_KEY")
 )
 
-# 2. Embedded RSS Feeds (extracted from OPML)
+# 2. Embedded RSS Feeds
 RSS_FEEDS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
     "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
@@ -44,55 +45,66 @@ def fetch_rss_data():
             res = requests.get(url, timeout=5)
             if res.status_code == 200:
                 parsed = feedparser.parse(res.content)
-                for entry in parsed.entries[:3]:
-                    collected_rss.append({"source": url, "title": entry.get("title", ""), "link": entry.get("link", "")})
+                entries = getattr(parsed, "entries", []) or []
+                for entry in entries[:3]:
+                    collected_rss.append({
+                        "source": url, 
+                        "title": entry.get("title", "No Title"), 
+                        "link": entry.get("link", "")
+                    })
         except Exception as e:
-            print(f"Error fetching RSS {url}: {e}")
+            print(f"Warning: RSS fetch failed for {url}: {e}")
     return collected_rss
 
 def autonomous_agent_search(topic="global financial and tech market trends"):
-    # Use Nemotron to generate precise custom search requests
     agent_prompt = f"""
     You are an autonomous research agent. Based on the topic '{topic}', generate 3 targeted search queries 
     optimized for Serpapi to find the absolute latest intelligence. Return only the queries separated by commas.
     """
     
-    response = opencode_client.chat.completions.create(
-        model="nemotron-3-ultra-free",
-        messages=[{"role": "user", "content": agent_prompt}],
-        temperature=0.3
-    )
-    
-    # Safely extract content and provide a fallback if the model returns None
-    raw_content = response.choices[0].message.content
-    
-    if raw_content:
-        queries = [q.strip() for q in raw_content.split(",")]
+    raw_content = None
+    for attempt in range(3):
+        try:
+            response = opencode_client.chat.completions.create(
+                model="nemotron-3-ultra-free",
+                messages=[{"role": "user", "content": agent_prompt}],
+                temperature=0.3
+            )
+            if response and getattr(response, "choices", None):
+                choice = response.choices[0] if len(response.choices) > 0 else None
+                if choice and getattr(choice, "message", None):
+                    raw_content = choice.message.content
+                    if raw_content:
+                        break
+        except Exception as e:
+            print(f"Nemotron attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
+            
+    if not raw_content:
+        print("Warning: Nemotron returned empty content after retries. Using fallback queries.")
+        queries = ["latest financial market trends", "top tech stock news", "global economic developments"]
     else:
-        print("Warning: Nemotron returned empty content. Using fallback queries.")
-        queries = [
-            "latest financial market trends", 
-            "top tech stock news", 
-            "global economic developments"
-        ]
-    
+        queries = [q.strip() for q in raw_content.split(",") if q.strip()]
+
     serpapi_results = []
     serp_key = os.getenv("SERPAPI_API_KEY")
     
-    for q in queries:
-        try:
-            res = requests.get(f"https://serpapi.com/search.json?q={q}&api_key={serp_key}", timeout=5)
-            if res.status_code == 200:
-                organic = res.json().get("organic_results", [])[:3]
-                for item in organic:
-                    serpapi_results.append({
-                        "query": q,
-                        "title": item.get("title"),
-                        "snippet": item.get("snippet"),
-                        "link": item.get("link")
-                    })
-        except Exception as e:
-            print(f"Serpapi search failed for query '{q}': {e}")
+    if serp_key:
+        for q in queries:
+            try:
+                res = requests.get(f"https://serpapi.com/search.json?q={q}&api_key={serp_key}", timeout=5)
+                if res.status_code == 200:
+                    data = res.json()
+                    organic = (data.get("organic_results") if isinstance(data, dict) else None) or []
+                    for item in organic[:3]:
+                        serpapi_results.append({
+                            "query": q,
+                            "title": item.get("title", ""),
+                            "snippet": item.get("snippet", ""),
+                            "link": item.get("link", "")
+                        })
+            except Exception as e:
+                print(f"Serpapi query '{q}' failed: {e}")
             
     return serpapi_results
 
@@ -101,9 +113,14 @@ def fetch_alpha_vantage():
     if not av_key:
         return []
     try:
-        res = requests.get(f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=technology,financial_markets&apikey={av_key}", timeout=5)
+        res = requests.get(
+            f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=technology,financial_markets&apikey={av_key}", 
+            timeout=5
+        )
         if res.status_code == 200:
-            return res.json().get("feed", [])[:5]
+            data = res.json()
+            feed = (data.get("feed") if isinstance(data, dict) else None) or []
+            return feed[:5]
     except Exception as e:
         print(f"Alpha Vantage fetch failed: {e}")
     return []
@@ -118,18 +135,37 @@ def synthesize_with_deepseek(all_data):
     {all_data}
     """
     
-    completion = nim_client.chat.completions.create(
-        model="deepseek-ai/deepseek-v4-pro-0813",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=1500
-    )
-    return completion.choices[0].message.content
+    for attempt in range(3):
+        try:
+            completion = nim_client.chat.completions.create(
+                model="deepseek-ai/deepseek-v4-pro-0813",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=1500
+            )
+            if completion and getattr(completion, "choices", None):
+                choice = completion.choices[0] if len(completion.choices) > 0 else None
+                if choice and getattr(choice, "message", None) and choice.message.content:
+                    return choice.message.content
+        except Exception as e:
+            print(f"DeepSeek attempt {attempt + 1} failed: {e}")
+            time.sleep(2)
+            
+    return "Error: Unable to generate daily summary from DeepSeek at this time."
 
 def post_to_discord(brief):
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if webhook_url:
-        requests.post(webhook_url, json={"content": brief})
+    if not webhook_url or not brief:
+        return
+
+    # Discord has a 2000 character limit per message payload
+    chunks = [brief[i:i+1900] for i in range(0, len(brief), 1900)]
+    for chunk in chunks:
+        try:
+            requests.post(webhook_url, json={"content": chunk}, timeout=5)
+            time.sleep(1)
+        except Exception as e:
+            print(f"Failed to post chunk to Discord: {e}")
 
 if __name__ == "__main__":
     print("Gathering data from RSS feeds...")
@@ -152,3 +188,4 @@ if __name__ == "__main__":
     
     print("Pushing brief to Discord...")
     post_to_discord(final_brief)
+    print("Pipeline completed successfully!")
