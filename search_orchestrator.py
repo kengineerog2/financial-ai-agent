@@ -29,7 +29,6 @@ RSS_FEEDS = [
     "https://www.economist.com/rss",
     "https://feeds.bloomberg.com/technology/news.rss",
     "https://www.forbes.com/business/feed/",
-    "https://feeds.content.marketwatch.com/marketwatch/rss/topstories",
     "https://www.theverge.com/rss/index.xml",
     "https://feeds.arstechnica.com/arstechnica/index",
     "https://techcrunch.com/feed/",
@@ -59,7 +58,7 @@ def autonomous_agent_search(topic="global financial and tech market trends"):
     """
     
     response = opencode_client.chat.completions.create(
-        model="opencode/nemotron-3-ultra-free",
+        model="nemotron-3-ultra-free",
         messages=[{"role": "user", "content": agent_prompt}],
         temperature=0.3
     )
