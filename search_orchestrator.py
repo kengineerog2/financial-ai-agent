@@ -62,7 +62,19 @@ def autonomous_agent_search(topic="global financial and tech market trends"):
         messages=[{"role": "user", "content": agent_prompt}],
         temperature=0.3
     )
-    queries = [q.strip() for q in response.choices[0].message.content.split(",")]
+    
+    # Safely extract content and provide a fallback if the model returns None
+    raw_content = response.choices[0].message.content
+    
+    if raw_content:
+        queries = [q.strip() for q in raw_content.split(",")]
+    else:
+        print("Warning: Nemotron returned empty content. Using fallback queries.")
+        queries = [
+            "latest financial market trends", 
+            "top tech stock news", 
+            "global economic developments"
+        ]
     
     serpapi_results = []
     serp_key = os.getenv("SERPAPI_API_KEY")
