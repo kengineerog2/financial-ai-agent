@@ -9,6 +9,7 @@ on:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -21,10 +22,52 @@ jobs:
       - name: Install Requirements
         run: pip install -r requirements.txt
 
+      - name: Verify API Secrets
+        env:
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+          ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          echo "Checking API secret configuration..."
+
+          if [ -n "$NVIDIA_NIM_API_KEY" ]; then
+            echo "✓ NVIDIA_NIM_API_KEY is available"
+          else
+            echo "✗ NVIDIA_NIM_API_KEY is MISSING"
+            exit 1
+          fi
+
+          if [ -n "$COHERE_API_KEY" ]; then
+            echo "✓ COHERE_API_KEY is available"
+          else
+            echo "✗ COHERE_API_KEY is MISSING"
+            exit 1
+          fi
+
+          if [ -n "$SERPAPI_API_KEY" ]; then
+            echo "✓ SERPAPI_API_KEY is available"
+          else
+            echo "⚠ SERPAPI_API_KEY is missing"
+          fi
+
+          if [ -n "$ALPHA_VANTAGE_API_KEY" ]; then
+            echo "✓ ALPHA_VANTAGE_API_KEY is available"
+          else
+            echo "⚠ ALPHA_VANTAGE_API_KEY is missing"
+          fi
+
+          if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+            echo "✓ DISCORD_WEBHOOK_URL is available"
+          else
+            echo "⚠ DISCORD_WEBHOOK_URL is missing"
+          fi
+
       - name: Execute Main Script
         env:
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           ALPHA_VANTAGE_API_KEY: ${{ secrets.ALPHA_VANTAGE_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
