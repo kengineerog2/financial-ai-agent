@@ -2,3 +2,4 @@ requests==2.31.0
 feedparser==6.0.10
 openai==1.60.0
 httpx==0.27.2
+cohere
