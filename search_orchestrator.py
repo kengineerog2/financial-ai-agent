@@ -1,4 +1,3 @@
-````python
 import os
 import json
 import random
@@ -861,4 +860,3 @@ if __name__ == "__main__":
         # Important:
         # Exit non-zero so GitHub Actions correctly marks the run FAILED.
         raise
-````
