@@ -125,7 +125,7 @@ def fetch_alpha_vantage():
         print(f"Alpha Vantage fetch failed: {e}")
     return []
 
-def synthesize_with_deepseek(all_data):
+def synthesize_with_Kimi(all_data):
     prompt = f"""
     You are an elite financial strategist. Analyze, cross-verify, and synthesize the massive multi-source data below 
     (combining live search intelligence, structured financial feeds, and global RSS streams). 
@@ -138,7 +138,7 @@ def synthesize_with_deepseek(all_data):
     for attempt in range(3):
         try:
             completion = nim_client.chat.completions.create(
-                model="deepseek-ai/deepseek-v4-pro-0813",
+                model="moonshotai/kimi-k3",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=1500
@@ -148,10 +148,10 @@ def synthesize_with_deepseek(all_data):
                 if choice and getattr(choice, "message", None) and choice.message.content:
                     return choice.message.content
         except Exception as e:
-            print(f"DeepSeek attempt {attempt + 1} failed: {e}")
+            print(f"Kimi attempt {attempt + 1} failed: {e}")
             time.sleep(2)
             
-    return "Error: Unable to generate daily summary from DeepSeek at this time."
+    return "Error: Unable to generate daily summary from Kimi at this time."
 
 def post_to_discord(brief):
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
@@ -183,8 +183,8 @@ if __name__ == "__main__":
         "financial_apis": av_data
     }
     
-    print("Synthesizing brief with DeepSeek-V4-Pro-0813...")
-    final_brief = synthesize_with_deepseek(master_payload)
+    print("Synthesizing brief with Kimi-V4-Pro-0813...")
+    final_brief = synthesize_with_Kimi(master_payload)
     
     print("Pushing brief to Discord...")
     post_to_discord(final_brief)
