@@ -2,18 +2,25 @@ import os
 import json
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 import feedparser
 from openai import OpenAI
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
-REQUEST_TIMEOUT = 180
+# Hard network timeout for individual HTTP requests.
+REQUEST_TIMEOUT = 30
+
+# Maximum number of simultaneous network workers.
+# 19 RSS feeds + search requests can all run concurrently.
+MAX_WORKERS = 24
 
 COHERE_QUERY_MODEL = "command-a-plus-05-2026"
 
@@ -31,12 +38,34 @@ FALLBACK_MODELS = [
     "openai/gpt-oss-20b",
 ]
 
-# The weakest fallback is deliberately last.
 DUMBEST_LAST_MODEL = "openai/gpt-oss-20b"
 
 
+RSS_FEEDS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=reuters",
+    "http://rss.cnn.com/rss/edition.rss",
+    "https://www.theguardian.com/world/rss",
+    "https://feeds.npr.org/1001/rss.xml",
+    "https://apnews.com/hub/ap-top-news/feed",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+    "https://www.ft.com/?format=rss",
+    "https://www.economist.com/rss",
+    "https://feeds.bloomberg.com/technology/news.rss",
+    "https://www.forbes.com/business/feed/",
+    "https://www.theverge.com/rss/index.xml",
+    "https://feeds.arstechnica.com/arstechnica/index",
+    "https://techcrunch.com/feed/",
+    "https://hnrss.org/frontpage",
+    "https://www.technologyreview.com/feed/",
+    "https://www.wired.com/feed/rss",
+]
+
+
 # ============================================================
-# SECRET HELPERS
+# SECRETS
 # ============================================================
 
 def get_required_secret(name):
@@ -56,10 +85,9 @@ COHERE_API_KEY = get_required_secret("COHERE_API_KEY")
 
 
 # ============================================================
-# COHERE CLIENT
+# COHERE OPENAI-COMPATIBLE CLIENT
 # ============================================================
 
-# Official Cohere OpenAI-compatible endpoint.
 cohere_client = OpenAI(
     base_url="https://api.cohere.ai/compatibility/v1",
     api_key=COHERE_API_KEY,
@@ -67,19 +95,7 @@ cohere_client = OpenAI(
 
 
 # ============================================================
-# RSS SOURCES
-# ============================================================
-
-RSS_FEEDS = [
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://feeds.reuters.com/reuters/technologyNews",
-    "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://feeds.bbci.co.uk/news/technology/rss.xml",
-]
-
-
-# ============================================================
-# UTILITY FUNCTIONS
+# GENERAL HELPERS
 # ============================================================
 
 def clean_text(value):
@@ -99,10 +115,6 @@ def truncate_text(value, max_chars):
 
 
 def extract_response_text(data):
-    """
-    Extract text from an NVIDIA OpenAI-compatible response.
-    """
-
     try:
         choices = data.get("choices", [])
 
@@ -110,7 +122,6 @@ def extract_response_text(data):
             return ""
 
         message = choices[0].get("message", {})
-
         content = message.get("content")
 
         if isinstance(content, str):
@@ -135,47 +146,137 @@ def extract_response_text(data):
 
 
 # ============================================================
-# STEP 1 — RSS COLLECTION
+# RSS
 # ============================================================
 
+def fetch_rss_feed(feed_url):
+    """
+    Fetch exactly one RSS feed.
+
+    This function is deliberately isolated so ThreadPoolExecutor
+    can run every feed independently.
+
+    A broken feed cannot kill the entire collection process.
+    """
+
+    print(f"  RSS -> {feed_url}", flush=True)
+
+    try:
+        response = requests.get(
+            feed_url,
+            timeout=REQUEST_TIMEOUT,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; FinancialAIResearchBot/1.0)"
+                )
+            },
+        )
+
+        response.raise_for_status()
+
+        feed = feedparser.parse(response.content)
+
+        articles = []
+
+        for entry in feed.entries[:10]:
+            title = clean_text(entry.get("title"))
+
+            summary = clean_text(
+                entry.get("summary")
+                or entry.get("description")
+                or ""
+            )
+
+            link = clean_text(entry.get("link"))
+
+            if not title:
+                continue
+
+            articles.append(
+                {
+                    "title": title,
+                    "summary": truncate_text(summary, 1200),
+                    "link": link,
+                    "source": feed_url,
+                }
+            )
+
+        print(
+            f"  RSS ✓ {feed_url} -> {len(articles)} articles",
+            flush=True,
+        )
+
+        return articles
+
+    except requests.Timeout:
+        print(
+            f"  RSS ⏱ TIMEOUT after {REQUEST_TIMEOUT}s -> {feed_url}",
+            flush=True,
+        )
+
+        return []
+
+    except requests.RequestException as exc:
+        print(
+            f"  RSS ✗ HTTP/network error -> {feed_url}: {exc}",
+            flush=True,
+        )
+
+        return []
+
+    except Exception as exc:
+        print(
+            f"  RSS ✗ parser error -> {feed_url}: {exc}",
+            flush=True,
+        )
+
+        return []
+
+
 def collect_rss_articles():
-    print("[1/5] Collecting RSS financial and technology news...")
+    """
+    Fetch ALL RSS feeds concurrently.
 
-    articles = []
+    Every feed gets its own worker.
 
-    for feed_url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(feed_url)
+    One feed timing out does not stop any other feed.
+    """
 
-            for entry in feed.entries[:10]:
-                title = clean_text(entry.get("title"))
-                summary = clean_text(
-                    entry.get("summary")
-                    or entry.get("description")
-                    or ""
+    print(
+        f"[1/5] Collecting {len(RSS_FEEDS)} RSS feeds concurrently...",
+        flush=True,
+    )
+
+    all_articles = []
+
+    with ThreadPoolExecutor(
+        max_workers=min(MAX_WORKERS, len(RSS_FEEDS))
+    ) as executor:
+
+        futures = {
+            executor.submit(fetch_rss_feed, feed_url): feed_url
+            for feed_url in RSS_FEEDS
+        }
+
+        for future in as_completed(futures):
+            feed_url = futures[future]
+
+            try:
+                articles = future.result()
+                all_articles.extend(articles)
+
+            except Exception as exc:
+                print(
+                    f"  RSS worker crashed -> {feed_url}: {exc}",
+                    flush=True,
                 )
-                link = clean_text(entry.get("link"))
 
-                if not title:
-                    continue
-
-                articles.append(
-                    {
-                        "title": title,
-                        "summary": truncate_text(summary, 1200),
-                        "link": link,
-                        "source": feed_url,
-                    }
-                )
-
-        except Exception as exc:
-            print(f"  RSS error for {feed_url}: {exc}")
-
-    # Remove duplicate titles.
+    # Deduplicate by title.
     deduplicated = []
     seen_titles = set()
 
-    for article in articles:
+    for article in all_articles:
         key = article["title"].lower()
 
         if key in seen_titles:
@@ -184,21 +285,28 @@ def collect_rss_articles():
         seen_titles.add(key)
         deduplicated.append(article)
 
-    print(f"  RSS articles collected: {len(deduplicated)}")
+    print(
+        f"  RSS collection complete: "
+        f"{len(deduplicated)} unique articles",
+        flush=True,
+    )
 
     return deduplicated
 
 
 # ============================================================
-# STEP 2 — COHERE AUTONOMOUS RESEARCH PLANNER
+# COHERE AUTONOMOUS RESEARCH PLANNER
 # ============================================================
 
 def autonomous_agent_search(articles):
-    print("[2/5] Asking Cohere to generate autonomous research queries...")
+    print(
+        "[2/5] Asking Cohere to generate autonomous research queries...",
+        flush=True,
+    )
 
     article_context = "\n".join(
         f"- {article['title']}: {article['summary']}"
-        for article in articles[:20]
+        for article in articles[:30]
     )
 
     agent_prompt = f"""
@@ -225,7 +333,7 @@ Requirements:
 - Do not write things like "We need to..." or "The queries should..."
 - Keep each query concise and useful for a search engine.
 
-Example format:
+Example:
 
 {{
   "queries": [
@@ -262,10 +370,16 @@ Recent news:
 
         raw = response.choices[0].message.content.strip()
 
-        print("  Cohere raw planner output:")
-        print(f"    {raw}")
+        print(
+            "  Cohere planner output:",
+            flush=True,
+        )
 
-        # Handle accidental markdown fences.
+        print(
+            f"    {raw}",
+            flush=True,
+        )
+
         if raw.startswith("```"):
             raw = raw.replace("```json", "", 1)
             raw = raw.replace("```", "")
@@ -276,50 +390,81 @@ Recent news:
         queries = parsed.get("queries")
 
         if not isinstance(queries, list):
-            raise ValueError("Cohere response did not contain a queries list.")
+            raise ValueError(
+                "Cohere response did not contain a queries list."
+            )
 
         queries = [
             clean_text(query)
             for query in queries
-            if isinstance(query, str) and clean_text(query)
+            if isinstance(query, str)
+            and clean_text(query)
         ]
 
         if len(queries) != 3:
             raise ValueError(
-                f"Cohere returned {len(queries)} valid queries instead of 3."
+                f"Cohere returned {len(queries)} valid queries "
+                "instead of 3."
             )
 
-        print("  Research queries:")
+        print("  Research queries:", flush=True)
 
         for query in queries:
-            print(f"    - {query}")
+            print(
+                f"    - {query}",
+                flush=True,
+            )
 
         return queries
 
     except Exception as exc:
-        print(f"  Cohere planner failed: {exc}")
-        print("  Using safe research-query fallback.")
+        print(
+            f"  Cohere planner failed: {exc}",
+            flush=True,
+        )
+
+        print(
+            "  Using safe research-query fallback.",
+            flush=True,
+        )
 
         fallback_queries = [
-            "latest global financial markets stocks bonds commodities central banks",
-            "latest AI technology semiconductor companies earnings market news",
-            "latest global economy inflation interest rates trade GDP central banks",
+            (
+                "latest global financial markets "
+                "stocks bonds commodities central banks"
+            ),
+            (
+                "latest AI technology semiconductor "
+                "companies earnings market news"
+            ),
+            (
+                "latest global economy inflation "
+                "interest rates trade GDP central banks"
+            ),
         ]
 
         for query in fallback_queries:
-            print(f"    - {query}")
+            print(
+                f"    - {query}",
+                flush=True,
+            )
 
         return fallback_queries
 
 
 # ============================================================
-# STEP 3 — SERPAPI SEARCH
+# SERPAPI
 # ============================================================
 
 def search_serpapi(query):
     api_key = os.getenv("SERPAPI_API_KEY")
 
     if not api_key:
+        print(
+            f"  SerpAPI skipped: no API key -> {query}",
+            flush=True,
+        )
+
         return []
 
     try:
@@ -333,7 +478,7 @@ def search_serpapi(query):
                 "hl": "en",
                 "gl": "us",
             },
-            timeout=30,
+            timeout=REQUEST_TIMEOUT,
         )
 
         response.raise_for_status()
@@ -359,28 +504,60 @@ def search_serpapi(query):
                 }
             )
 
+        print(
+            f"  SerpAPI ✓ {query} -> {len(results)} results",
+            flush=True,
+        )
+
         return results
 
+    except requests.Timeout:
+        print(
+            f"  SerpAPI ⏱ TIMEOUT after {REQUEST_TIMEOUT}s -> {query}",
+            flush=True,
+        )
+
+        return []
+
     except Exception as exc:
-        print(f"  SerpAPI error for '{query}': {exc}")
+        print(
+            f"  SerpAPI ✗ {query}: {exc}",
+            flush=True,
+        )
+
         return []
 
 
 def collect_serpapi_results(queries):
-    print("[3/5] Running autonomous web research...")
+    print(
+        "[3/5] Running autonomous web research concurrently...",
+        flush=True,
+    )
 
     all_results = []
 
-    for query in queries:
-        print(f"  Searching: {query}")
+    # All three searches happen simultaneously.
+    with ThreadPoolExecutor(
+        max_workers=len(queries)
+    ) as executor:
 
-        results = search_serpapi(query)
+        futures = {
+            executor.submit(search_serpapi, query): query
+            for query in queries
+        }
 
-        print(f"    Results: {len(results)}")
+        for future in as_completed(futures):
+            query = futures[future]
 
-        all_results.extend(results)
+            try:
+                results = future.result()
+                all_results.extend(results)
 
-        time.sleep(1)
+            except Exception as exc:
+                print(
+                    f"  SerpAPI worker crashed -> {query}: {exc}",
+                    flush=True,
+                )
 
     # Deduplicate.
     deduplicated = []
@@ -398,22 +575,32 @@ def collect_serpapi_results(queries):
         seen.add(key)
         deduplicated.append(result)
 
-    print(f"  Total unique web results: {len(deduplicated)}")
+    print(
+        f"  Total unique web results: {len(deduplicated)}",
+        flush=True,
+    )
 
     return deduplicated
 
 
 # ============================================================
-# STEP 4 — ALPHA VANTAGE
+# ALPHA VANTAGE
 # ============================================================
 
 def collect_alpha_vantage_news():
-    print("[4/5] Collecting Alpha Vantage market news...")
+    print(
+        "[4/5] Collecting Alpha Vantage market news...",
+        flush=True,
+    )
 
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
 
     if not api_key:
-        print("  ALPHA_VANTAGE_API_KEY not configured.")
+        print(
+            "  ALPHA_VANTAGE_API_KEY not configured.",
+            flush=True,
+        )
+
         return []
 
     try:
@@ -421,11 +608,16 @@ def collect_alpha_vantage_news():
             "https://www.alphavantage.co/query",
             params={
                 "function": "NEWS_SENTIMENT",
-                "topics": "financial_markets,economy_fiscal,economy_monetary,technology",
+                "topics": (
+                    "financial_markets,"
+                    "economy_fiscal,"
+                    "economy_monetary,"
+                    "technology"
+                ),
                 "limit": 20,
                 "apikey": api_key,
             },
-            timeout=30,
+            timeout=REQUEST_TIMEOUT,
         )
 
         response.raise_for_status()
@@ -447,36 +639,53 @@ def collect_alpha_vantage_news():
             results.append(
                 {
                     "title": title,
-                    "summary": truncate_text(summary, 1200),
+                    "summary": truncate_text(
+                        summary,
+                        1200,
+                    ),
                     "link": url,
                     "source": "Alpha Vantage",
                 }
             )
 
-        print(f"  Alpha Vantage articles: {len(results)}")
+        print(
+            f"  Alpha Vantage ✓ {len(results)} articles",
+            flush=True,
+        )
 
         return results
 
+    except requests.Timeout:
+        print(
+            "  Alpha Vantage ⏱ TIMEOUT after "
+            f"{REQUEST_TIMEOUT}s",
+            flush=True,
+        )
+
+        return []
+
     except Exception as exc:
-        print(f"  Alpha Vantage error: {exc}")
+        print(
+            f"  Alpha Vantage ✗ {exc}",
+            flush=True,
+        )
+
         return []
 
 
 # ============================================================
-# MODEL CONFIGURATION
+# NVIDIA MODEL FALLBACK
 # ============================================================
 
 def build_model_order():
     """
-    Model order:
+    GLM Flash always gets first shot.
 
-        1. GLM-5.3-Flash
-        2. GLM-5.3
-        3-7. Randomized fallback models
-        LAST. GPT-OSS-20B
+    GLM non-Flash immediately follows it.
 
-    This means the system gets randomness without ever accidentally
-    putting the weakest fallback ahead of the stronger models.
+    The remaining stronger fallback models are randomized.
+
+    GPT-OSS-20B is ALWAYS LAST.
     """
 
     randomized = [
@@ -495,21 +704,16 @@ def build_model_order():
 
 
 def model_payload(model, prompt):
-    """
-    Build an NVIDIA-compatible request.
-
-    Some models have model-specific reasoning controls, so only add
-    parameters where they are known to be appropriate.
-    """
-
     payload = {
         "model": model,
+
         "messages": [
             {
                 "role": "system",
                 "content": (
                     "You are an expert financial research analyst. "
-                    "Produce accurate, concise, evidence-grounded analysis. "
+                    "Produce accurate, concise, evidence-grounded "
+                    "analysis. "
                     "Do not invent facts, prices, events, or sources."
                 ),
             },
@@ -518,20 +722,19 @@ def model_payload(model, prompt):
                 "content": prompt,
             },
         ],
+
         "temperature": 0.2,
         "top_p": 0.95,
         "max_tokens": 2500,
         "stream": False,
     }
 
-    # GLM supports explicit reasoning effort.
     if model in {
         "z-ai/glm-5-3-flash",
         "z-ai/glm-5-3",
     }:
         payload["reasoning_effort"] = "max"
 
-    # Nemotron 3 uses the NVIDIA chat-template thinking switch.
     elif model in {
         "nvidia/nemotron-3-ultra-550b-a55b",
         "nvidia/nemotron-3-super-120b-a12b",
@@ -543,37 +746,55 @@ def model_payload(model, prompt):
     return payload
 
 
-# ============================================================
-# STEP 5 — NVIDIA MODEL CALL
-# ============================================================
-
 def call_nvidia_model(model, prompt):
-    print(f"\n  >>> Trying model: {model}")
+    print(
+        f"\n  >>> Trying model: {model}",
+        flush=True,
+    )
 
-    payload = model_payload(model, prompt)
+    payload = model_payload(
+        model,
+        prompt,
+    )
 
     try:
         response = requests.post(
             NVIDIA_CHAT_URL,
+
             headers={
-                "Authorization": f"Bearer {NVIDIA_NIM_API_KEY}",
+                "Authorization": (
+                    f"Bearer {NVIDIA_NIM_API_KEY}"
+                ),
                 "Content-Type": "application/json",
                 "Accept": "application/json",
             },
+
             json=payload,
+
             timeout=REQUEST_TIMEOUT,
         )
 
-        print(f"      HTTP status: {response.status_code}")
+        print(
+            f"      HTTP status: {response.status_code}",
+            flush=True,
+        )
 
         if not response.ok:
             error_body = response.text[:2000]
 
-            print("      NVIDIA API error:")
-            print(f"      {error_body}")
+            print(
+                "      NVIDIA API error:",
+                flush=True,
+            )
+
+            print(
+                f"      {error_body}",
+                flush=True,
+            )
 
             raise RuntimeError(
-                f"NVIDIA returned HTTP {response.status_code}: "
+                "NVIDIA returned HTTP "
+                f"{response.status_code}: "
                 f"{error_body}"
             )
 
@@ -583,19 +804,22 @@ def call_nvidia_model(model, prompt):
 
         if not text:
             raise RuntimeError(
-                "NVIDIA returned a successful response but no text content."
+                "NVIDIA returned a successful response "
+                "but no text content."
             )
 
         print(
             f"      ✓ {model} succeeded "
-            f"({len(text)} characters)"
+            f"({len(text)} characters)",
+            flush=True,
         )
 
         return text
 
     except requests.Timeout:
         raise RuntimeError(
-            f"{model} timed out after {REQUEST_TIMEOUT} seconds."
+            f"{model} timed out after "
+            f"{REQUEST_TIMEOUT} seconds."
         )
 
     except requests.RequestException as exc:
@@ -609,8 +833,19 @@ def call_nvidia_model(model, prompt):
         )
 
 
-def generate_daily_summary(rss_articles, web_results, market_news):
-    print("\n[5/5] Generating financial intelligence brief...")
+# ============================================================
+# FINANCIAL SYNTHESIS
+# ============================================================
+
+def generate_daily_summary(
+    rss_articles,
+    web_results,
+    market_news,
+):
+    print(
+        "\n[5/5] Generating financial intelligence brief...",
+        flush=True,
+    )
 
     combined_sources = []
 
@@ -630,12 +865,15 @@ def generate_daily_summary(rss_articles, web_results, market_news):
     for result in market_news:
         combined_sources.append(result)
 
-    # Prevent the prompt from becoming unnecessarily enormous.
-    combined_sources = combined_sources[:80]
+    # Prevent enormous prompts.
+    combined_sources = combined_sources[:100]
 
     source_text_parts = []
 
-    for index, item in enumerate(combined_sources, start=1):
+    for index, item in enumerate(
+        combined_sources,
+        start=1,
+    ):
         source_text_parts.append(
             f"""
 SOURCE {index}
@@ -646,7 +884,9 @@ URL: {item.get('link', '')}
 """.strip()
         )
 
-    source_text = "\n\n".join(source_text_parts)
+    source_text = "\n\n".join(
+        source_text_parts
+    )
 
     prompt = f"""
 Create today's autonomous financial intelligence brief.
@@ -687,38 +927,64 @@ Research material:
 
     model_order = build_model_order()
 
-    print("\n  MODEL FALLBACK ORDER:")
+    print(
+        "\n  MODEL FALLBACK ORDER:",
+        flush=True,
+    )
 
-    for position, model in enumerate(model_order, start=1):
-        print(f"    {position}. {model}")
+    for position, model in enumerate(
+        model_order,
+        start=1,
+    ):
+        print(
+            f"    {position}. {model}",
+            flush=True,
+        )
 
     failures = []
 
     for model in model_order:
+
         try:
-            summary = call_nvidia_model(model, prompt)
+            summary = call_nvidia_model(
+                model,
+                prompt,
+            )
 
             if summary and len(summary.strip()) >= 100:
                 print(
-                    f"\n  ✓ Daily brief generated successfully "
-                    f"using {model}"
+                    "\n  ✓ Daily brief generated successfully "
+                    f"using {model}",
+                    flush=True,
                 )
 
-                return summary.strip(), model
+                return (
+                    summary.strip(),
+                    model,
+                )
 
-            failure = f"{model}: response was too short"
-            print(f"      ✗ {failure}")
+            failure = (
+                f"{model}: response was too short"
+            )
+
+            print(
+                f"      ✗ {failure}",
+                flush=True,
+            )
+
             failures.append(failure)
 
         except Exception as exc:
-            failure = f"{model}: {exc}"
+            failure = (
+                f"{model}: {exc}"
+            )
 
-            print(f"      ✗ {failure}")
+            print(
+                f"      ✗ {failure}",
+                flush=True,
+            )
 
             failures.append(failure)
-
-            # Small delay before moving to the next provider/model.
-            time.sleep(1)
 
     failure_text = "\n".join(
         f"  - {failure}"
@@ -736,85 +1002,142 @@ Research material:
 # DISCORD
 # ============================================================
 
-def send_to_discord(summary, model_used):
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+def send_to_discord(
+    summary,
+    model_used,
+):
+    webhook_url = os.getenv(
+        "DISCORD_WEBHOOK_URL"
+    )
 
     if not webhook_url:
-        print("DISCORD_WEBHOOK_URL is not configured.")
+        print(
+            "DISCORD_WEBHOOK_URL is not configured.",
+            flush=True,
+        )
+
         return False
 
     content = (
-        f"**🤖 Autonomous Financial AI Brief**\n"
+        "**🤖 Autonomous Financial AI Brief**\n"
         f"*Generated by `{model_used}`*\n\n"
         f"{summary}"
     )
 
-    # Discord has a 2000-character message limit.
+    # Discord's normal message limit is 2000 characters.
     chunks = [
         content[i:i + 1900]
-        for i in range(0, len(content), 1900)
+        for i in range(
+            0,
+            len(content),
+            1900,
+        )
     ]
 
     try:
-        for chunk in chunks:
-            response = requests.post(
-                webhook_url,
-                json={
-                    "content": chunk
-                },
-                timeout=30,
-            )
 
-            response.raise_for_status()
+        # Discord messages can also be sent concurrently.
+        # Keep this small so we don't unnecessarily hammer
+        # the webhook.
+        with ThreadPoolExecutor(
+            max_workers=4
+        ) as executor:
 
-            time.sleep(0.5)
+            futures = [
+                executor.submit(
+                    post_discord_chunk,
+                    webhook_url,
+                    chunk,
+                )
+                for chunk in chunks
+            ]
 
-        print("✓ Discord delivery successful.")
+            for future in as_completed(futures):
+                future.result()
+
+        print(
+            "✓ Discord delivery successful.",
+            flush=True,
+        )
 
         return True
 
     except Exception as exc:
-        print(f"Discord delivery failed: {exc}")
+        print(
+            f"Discord delivery failed: {exc}",
+            flush=True,
+        )
+
         return False
 
 
+def post_discord_chunk(
+    webhook_url,
+    chunk,
+):
+    response = requests.post(
+        webhook_url,
+        json={
+            "content": chunk
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+
 # ============================================================
-# MAIN PIPELINE
+# MAIN
 # ============================================================
 
 def main():
-    print("=" * 70)
-    print("AUTONOMOUS FINANCIAL AI DISPATCH")
-    print("=" * 70)
+    print(
+        "=" * 70,
+        flush=True,
+    )
+
+    print(
+        "AUTONOMOUS FINANCIAL AI DISPATCH",
+        flush=True,
+    )
+
+    print(
+        "=" * 70,
+        flush=True,
+    )
 
     start_time = time.time()
 
     # --------------------------------------------------------
-    # 1. RSS
+    # 1. RSS — ALL 19 FEEDS IN PARALLEL
     # --------------------------------------------------------
 
     rss_articles = collect_rss_articles()
 
     # --------------------------------------------------------
-    # 2. Cohere autonomous research planning
+    # 2. COHERE — AUTONOMOUS QUERY GENERATION
     # --------------------------------------------------------
 
-    queries = autonomous_agent_search(rss_articles)
+    queries = autonomous_agent_search(
+        rss_articles
+    )
 
     # --------------------------------------------------------
-    # 3. Search
+    # 3. SERPAPI — ALL QUERIES IN PARALLEL
     # --------------------------------------------------------
 
-    web_results = collect_serpapi_results(queries)
+    web_results = collect_serpapi_results(
+        queries
+    )
 
     # --------------------------------------------------------
-    # 4. Market data/news
+    # 4. ALPHA VANTAGE
     # --------------------------------------------------------
 
     market_news = collect_alpha_vantage_news()
 
     # --------------------------------------------------------
-    # 5. AI synthesis + fallback ladder
+    # 5. NVIDIA — FALLBACK LADDER
     # --------------------------------------------------------
 
     summary, model_used = generate_daily_summary(
@@ -824,10 +1147,13 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Discord
+    # 6. DISCORD
     # --------------------------------------------------------
 
-    if not send_to_discord(summary, model_used):
+    if not send_to_discord(
+        summary,
+        model_used,
+    ):
         raise RuntimeError(
             "The financial brief was generated successfully, "
             "but Discord delivery failed."
@@ -835,28 +1161,74 @@ def main():
 
     elapsed = time.time() - start_time
 
-    print("\n" + "=" * 70)
-    print("PIPELINE COMPLETE")
-    print(f"Model used: {model_used}")
-    print(f"Runtime: {elapsed:.1f} seconds")
-    print("=" * 70)
+    print(
+        "\n" + "=" * 70,
+        flush=True,
+    )
 
+    print(
+        "PIPELINE COMPLETE",
+        flush=True,
+    )
+
+    print(
+        f"Model used: {model_used}",
+        flush=True,
+    )
+
+    print(
+        f"Runtime: {elapsed:.1f} seconds",
+        flush=True,
+    )
+
+    print(
+        "=" * 70,
+        flush=True,
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
+
     try:
         main()
 
     except KeyboardInterrupt:
-        print("\nPipeline interrupted.")
+        print(
+            "\nPipeline interrupted.",
+            flush=True,
+        )
+
         raise
 
     except Exception as exc:
-        print("\n" + "=" * 70)
-        print("PIPELINE FAILED")
-        print("=" * 70)
-        print(str(exc))
-        print("=" * 70)
 
-        # Important:
-        # Exit non-zero so GitHub Actions correctly marks the run FAILED.
+        print(
+            "\n" + "=" * 70,
+            flush=True,
+        )
+
+        print(
+            "PIPELINE FAILED",
+            flush=True,
+        )
+
+        print(
+            "=" * 70,
+            flush=True,
+        )
+
+        print(
+            str(exc),
+            flush=True,
+        )
+
+        print(
+            "=" * 70,
+            flush=True,
+        )
+
         raise
