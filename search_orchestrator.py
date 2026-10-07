@@ -1,4 +1,7 @@
+````python
 import os
+import json
+import random
 import time
 import requests
 import feedparser
@@ -6,50 +9,61 @@ from openai import OpenAI
 
 
 # ============================================================
-# CONFIGURATION / SECRET VALIDATION
+# CONFIGURATION
+# ============================================================
+
+NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+REQUEST_TIMEOUT = 180
+
+COHERE_QUERY_MODEL = "command-a-plus-05-2026"
+
+PRIMARY_MODELS = [
+    "z-ai/glm-5-3-flash",
+    "z-ai/glm-5-3",
+]
+
+FALLBACK_MODELS = [
+    "deepseek-ai/deepseek-v4.1-flash",
+    "moonshotai/kimi-k3",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "google/gemma-4-31b-it",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "openai/gpt-oss-20b",
+]
+
+# The weakest fallback is deliberately last.
+DUMBEST_LAST_MODEL = "openai/gpt-oss-20b"
+
+
+# ============================================================
+# SECRET HELPERS
 # ============================================================
 
 def get_required_secret(name):
-    """
-    Get a required environment variable without ever printing
-    its value.
-    """
     value = os.getenv(name)
 
     if not value:
         raise RuntimeError(
             f"{name} is missing from the GitHub Actions environment. "
-            f"Add it under GitHub Settings -> Secrets and variables -> Actions."
+            "Add it under GitHub Settings -> Secrets and variables -> Actions."
         )
 
     return value
 
 
-# ============================================================
-# API CLIENTS
-# ============================================================
-
-# NVIDIA NIM
-# Used for final synthesis with GLM-5.3-Flash.
 NVIDIA_NIM_API_KEY = get_required_secret("NVIDIA_NIM_API_KEY")
-
-nim_client = OpenAI(
-    base_url="https://integrate.api.nvidia.com/v1",
-    api_key=NVIDIA_NIM_API_KEY
-)
-
-
-# Cohere OpenAI-compatible API
-# Used for autonomous research-query generation.
-#
-# IMPORTANT:
-# This does NOT use the Cohere Python SDK.
-# It uses the OpenAI SDK against Cohere's compatibility endpoint.
 COHERE_API_KEY = get_required_secret("COHERE_API_KEY")
 
+
+# ============================================================
+# COHERE CLIENT
+# ============================================================
+
+# Official Cohere OpenAI-compatible endpoint.
 cohere_client = OpenAI(
     base_url="https://api.cohere.ai/compatibility/v1",
-    api_key=COHERE_API_KEY
+    api_key=COHERE_API_KEY,
 )
 
 
@@ -66,11 +80,67 @@ RSS_FEEDS = [
 
 
 # ============================================================
-# RSS COLLECTION
+# UTILITY FUNCTIONS
 # ============================================================
 
-def collect_rss_news():
-    print("Collecting RSS news...")
+def clean_text(value):
+    if value is None:
+        return ""
+
+    return " ".join(str(value).split()).strip()
+
+
+def truncate_text(value, max_chars):
+    value = clean_text(value)
+
+    if len(value) <= max_chars:
+        return value
+
+    return value[:max_chars].rstrip() + "..."
+
+
+def extract_response_text(data):
+    """
+    Extract text from an NVIDIA OpenAI-compatible response.
+    """
+
+    try:
+        choices = data.get("choices", [])
+
+        if not choices:
+            return ""
+
+        message = choices[0].get("message", {})
+
+        content = message.get("content")
+
+        if isinstance(content, str):
+            return content.strip()
+
+        if isinstance(content, list):
+            pieces = []
+
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+
+                    if text:
+                        pieces.append(str(text))
+
+            return "\n".join(pieces).strip()
+
+    except Exception:
+        pass
+
+    return ""
+
+
+# ============================================================
+# STEP 1 — RSS COLLECTION
+# ============================================================
+
+def collect_rss_articles():
+    print("[1/5] Collecting RSS financial and technology news...")
 
     articles = []
 
@@ -79,145 +149,192 @@ def collect_rss_news():
             feed = feedparser.parse(feed_url)
 
             for entry in feed.entries[:10]:
-                title = getattr(entry, "title", "").strip()
-                link = getattr(entry, "link", "").strip()
-                summary = getattr(entry, "summary", "").strip()
+                title = clean_text(entry.get("title"))
+                summary = clean_text(
+                    entry.get("summary")
+                    or entry.get("description")
+                    or ""
+                )
+                link = clean_text(entry.get("link"))
 
                 if not title:
                     continue
 
-                articles.append({
-                    "title": title,
-                    "link": link,
-                    "summary": summary
-                })
+                articles.append(
+                    {
+                        "title": title,
+                        "summary": truncate_text(summary, 1200),
+                        "link": link,
+                        "source": feed_url,
+                    }
+                )
 
-        except Exception as e:
-            print(f"RSS error for {feed_url}: {e}")
+        except Exception as exc:
+            print(f"  RSS error for {feed_url}: {exc}")
 
-    return articles
+    # Remove duplicate titles.
+    deduplicated = []
+    seen_titles = set()
+
+    for article in articles:
+        key = article["title"].lower()
+
+        if key in seen_titles:
+            continue
+
+        seen_titles.add(key)
+        deduplicated.append(article)
+
+    print(f"  RSS articles collected: {len(deduplicated)}")
+
+    return deduplicated
 
 
 # ============================================================
-# COHERE AUTONOMOUS RESEARCH
+# STEP 2 — COHERE AUTONOMOUS RESEARCH PLANNER
 # ============================================================
 
-def autonomous_agent_search():
-    """
-    Ask Cohere Command A+ to determine which three web searches
-    are most useful for the current financial briefing.
+def autonomous_agent_search(articles):
+    print("[2/5] Asking Cohere to generate autonomous research queries...")
 
-    Cohere is accessed through its OpenAI-compatible API.
-    """
+    article_context = "\n".join(
+        f"- {article['title']}: {article['summary']}"
+        for article in articles[:20]
+    )
 
-    agent_prompt = """
-You are the autonomous research planner for a daily financial
-intelligence briefing.
+    agent_prompt = f"""
+You are the autonomous research planner for a financial intelligence system.
 
-Determine the three most useful web search queries for finding
-important current developments in:
+Based on the news headlines below, generate exactly THREE useful web-search
+queries.
+
+The three queries MUST cover:
 
 1. Global financial markets
-2. Technology and AI companies
-3. Macroeconomics and major economic events
+2. Technology, AI, and semiconductor companies
+3. Global macroeconomics, inflation, interest rates, central banks, trade, or GDP
 
-Return EXACTLY three search queries.
+Requirements:
 
-Return ONLY the queries, one per line.
-Do not number them.
-Do not explain them.
-Do not use quotation marks.
+- Return ONLY valid JSON.
+- Return an object with exactly one key: "queries".
+- "queries" must contain exactly three strings.
+- Each string must be an actual search query.
+- Do not include numbering.
+- Do not include explanations.
+- Do not repeat the instructions.
+- Do not write things like "We need to..." or "The queries should..."
+- Keep each query concise and useful for a search engine.
+
+Example format:
+
+{{
+  "queries": [
+    "latest global stock bond commodity markets central banks",
+    "latest AI semiconductor technology company earnings market news",
+    "latest inflation interest rates GDP central bank global economy"
+  ]
+}}
+
+Recent news:
+
+{article_context}
 """
 
-    for attempt in range(3):
-        try:
-            print(
-                f"  Asking Cohere for research queries "
-                f"(attempt {attempt + 1}/3)..."
+    try:
+        response = cohere_client.chat.completions.create(
+            model=COHERE_QUERY_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a strict JSON-producing research planner. "
+                        "Never echo the user's instructions."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": agent_prompt,
+                },
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        print("  Cohere raw planner output:")
+        print(f"    {raw}")
+
+        # Handle accidental markdown fences.
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "", 1)
+            raw = raw.replace("```", "")
+            raw = raw.strip()
+
+        parsed = json.loads(raw)
+
+        queries = parsed.get("queries")
+
+        if not isinstance(queries, list):
+            raise ValueError("Cohere response did not contain a queries list.")
+
+        queries = [
+            clean_text(query)
+            for query in queries
+            if isinstance(query, str) and clean_text(query)
+        ]
+
+        if len(queries) != 3:
+            raise ValueError(
+                f"Cohere returned {len(queries)} valid queries instead of 3."
             )
 
-            response = cohere_client.chat.completions.create(
-                model="command-a-plus-05-2026",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": agent_prompt
-                    }
-                ],
-                temperature=0.3,
-                max_tokens=200
-            )
+        print("  Research queries:")
 
-            if not response.choices:
-                raise RuntimeError("Cohere returned no choices.")
+        for query in queries:
+            print(f"    - {query}")
 
-            content = response.choices[0].message.content
+        return queries
 
-            if not content:
-                raise RuntimeError("Cohere returned empty content.")
+    except Exception as exc:
+        print(f"  Cohere planner failed: {exc}")
+        print("  Using safe research-query fallback.")
 
-            # Clean up the response into individual queries.
-            queries = []
+        fallback_queries = [
+            "latest global financial markets stocks bonds commodities central banks",
+            "latest AI technology semiconductor companies earnings market news",
+            "latest global economy inflation interest rates trade GDP central banks",
+        ]
 
-            for line in content.splitlines():
-                query = line.strip()
+        for query in fallback_queries:
+            print(f"    - {query}")
 
-                # Remove common accidental formatting.
-                query = query.lstrip("-•* ")
-                query = query.lstrip("0123456789")
-                query = query.lstrip(". ")
-                query = query.strip()
-
-                if query:
-                    queries.append(query)
-
-            if len(queries) >= 3:
-                return queries[:3]
-
-            raise RuntimeError(
-                f"Cohere returned fewer than three queries: {queries}"
-            )
-
-        except Exception as e:
-            print(f"  Cohere error: {e}")
-
-            if attempt < 2:
-                time.sleep(2)
-
-    print("Cohere failed after three attempts.")
-    print("Using fallback research queries.")
-
-    return [
-        "latest financial market trends",
-        "latest technology and AI stock market news",
-        "latest global economic developments"
-    ]
+        return fallback_queries
 
 
 # ============================================================
-# SERPAPI SEARCH
+# STEP 3 — SERPAPI SEARCH
 # ============================================================
 
-def search_web(query):
-    """
-    Search the web through SerpAPI.
-    """
+def search_serpapi(query):
+    api_key = os.getenv("SERPAPI_API_KEY")
 
-    serp_key = os.getenv("SERPAPI_API_KEY")
-
-    if not serp_key:
-        print("WARNING: SERPAPI_API_KEY is not configured.")
+    if not api_key:
         return []
 
     try:
         response = requests.get(
             "https://serpapi.com/search.json",
             params={
+                "engine": "google",
                 "q": query,
-                "api_key": serp_key,
-                "engine": "google"
+                "api_key": api_key,
+                "num": 8,
+                "hl": "en",
+                "gl": "us",
             },
-            timeout=15
+            timeout=30,
         )
 
         response.raise_for_status()
@@ -226,33 +343,78 @@ def search_web(query):
 
         results = []
 
-        for item in data.get("organic_results", [])[:8]:
-            results.append({
-                "title": item.get("title", ""),
-                "link": item.get("link", ""),
-                "snippet": item.get("snippet", "")
-            })
+        for result in data.get("organic_results", []):
+            title = clean_text(result.get("title"))
+            snippet = clean_text(result.get("snippet"))
+            link = clean_text(result.get("link"))
+
+            if not title:
+                continue
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": snippet,
+                    "link": link,
+                    "source": "SerpAPI",
+                }
+            )
 
         return results
 
-    except Exception as e:
-        print(f"SerpAPI error for '{query}': {e}")
+    except Exception as exc:
+        print(f"  SerpAPI error for '{query}': {exc}")
         return []
 
 
+def collect_serpapi_results(queries):
+    print("[3/5] Running autonomous web research...")
+
+    all_results = []
+
+    for query in queries:
+        print(f"  Searching: {query}")
+
+        results = search_serpapi(query)
+
+        print(f"    Results: {len(results)}")
+
+        all_results.extend(results)
+
+        time.sleep(1)
+
+    # Deduplicate.
+    deduplicated = []
+    seen = set()
+
+    for result in all_results:
+        key = (
+            result["link"]
+            or result["title"]
+        ).lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduplicated.append(result)
+
+    print(f"  Total unique web results: {len(deduplicated)}")
+
+    return deduplicated
+
+
 # ============================================================
-# ALPHA VANTAGE
+# STEP 4 — ALPHA VANTAGE
 # ============================================================
 
-def collect_market_news():
-    """
-    Collect financial and technology news from Alpha Vantage.
-    """
+def collect_alpha_vantage_news():
+    print("[4/5] Collecting Alpha Vantage market news...")
 
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
 
     if not api_key:
-        print("WARNING: ALPHA_VANTAGE_API_KEY is not configured.")
+        print("  ALPHA_VANTAGE_API_KEY not configured.")
         return []
 
     try:
@@ -260,226 +422,338 @@ def collect_market_news():
             "https://www.alphavantage.co/query",
             params={
                 "function": "NEWS_SENTIMENT",
-                "topics": "technology,financial_markets",
-                "apikey": api_key
+                "topics": "financial_markets,economy_fiscal,economy_monetary,technology",
+                "limit": 20,
+                "apikey": api_key,
             },
-            timeout=15
+            timeout=30,
         )
 
         response.raise_for_status()
 
         data = response.json()
 
-        return data.get("feed", [])[:20]
+        feed = data.get("feed", [])
 
-    except Exception as e:
-        print(f"Alpha Vantage error: {e}")
+        results = []
+
+        for item in feed:
+            title = clean_text(item.get("title"))
+            summary = clean_text(item.get("summary"))
+            url = clean_text(item.get("url"))
+
+            if not title:
+                continue
+
+            results.append(
+                {
+                    "title": title,
+                    "summary": truncate_text(summary, 1200),
+                    "link": url,
+                    "source": "Alpha Vantage",
+                }
+            )
+
+        print(f"  Alpha Vantage articles: {len(results)}")
+
+        return results
+
+    except Exception as exc:
+        print(f"  Alpha Vantage error: {exc}")
         return []
 
 
 # ============================================================
-# GLM-5.3-FLASH FINAL SYNTHESIS
+# MODEL CONFIGURATION
 # ============================================================
 
-def generate_daily_summary(
-    rss_articles,
-    search_results,
-    market_news
-):
+def build_model_order():
     """
-    Synthesize all collected information into the final briefing
-    using NVIDIA NIM's GLM-5.3-Flash.
+    Model order:
 
-    Maximum reasoning effort is requested.
+        1. GLM-5.3-Flash
+        2. GLM-5.3
+        3-7. Randomized fallback models
+        LAST. GPT-OSS-20B
+
+    This means the system gets randomness without ever accidentally
+    putting the weakest fallback ahead of the stronger models.
     """
 
-    source_sections = []
+    randomized = [
+        model
+        for model in FALLBACK_MODELS
+        if model != DUMBEST_LAST_MODEL
+    ]
 
-    # --------------------------------------------------------
-    # RSS MATERIAL
-    # --------------------------------------------------------
+    random.shuffle(randomized)
 
-    if rss_articles:
-        rss_text = "\n".join(
-            (
-                f"- {article['title']}\n"
-                f"  {article['summary'][:500]}\n"
-                f"  URL: {article['link']}"
-            )
-            for article in rss_articles[:30]
-        )
+    return (
+        PRIMARY_MODELS
+        + randomized
+        + [DUMBEST_LAST_MODEL]
+    )
 
-        source_sections.append(
-            "RSS NEWS:\n" + rss_text
-        )
 
-    # --------------------------------------------------------
-    # WEB SEARCH MATERIAL
-    # --------------------------------------------------------
+def model_payload(model, prompt):
+    """
+    Build an NVIDIA-compatible request.
 
-    if search_results:
-        web_text = "\n".join(
-            (
-                f"- {result['title']}\n"
-                f"  {result['snippet'][:500]}\n"
-                f"  URL: {result['link']}"
-            )
-            for result in search_results[:30]
-        )
+    Some models have model-specific reasoning controls, so only add
+    parameters where they are known to be appropriate.
+    """
 
-        source_sections.append(
-            "WEB SEARCH RESULTS:\n" + web_text
-        )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert financial research analyst. "
+                    "Produce accurate, concise, evidence-grounded analysis. "
+                    "Do not invent facts, prices, events, or sources."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        "temperature": 0.2,
+        "top_p": 0.95,
+        "max_tokens": 2500,
+        "stream": False,
+    }
 
-    # --------------------------------------------------------
-    # ALPHA VANTAGE MATERIAL
-    # --------------------------------------------------------
+    # GLM supports explicit reasoning effort.
+    if model in {
+        "z-ai/glm-5-3-flash",
+        "z-ai/glm-5-3",
+    }:
+        payload["reasoning_effort"] = "max"
 
-    if market_news:
-        market_items = []
+    # Nemotron 3 uses the NVIDIA chat-template thinking switch.
+    elif model in {
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "nvidia/nemotron-3-super-120b-a12b",
+    }:
+        payload["chat_template_kwargs"] = {
+            "enable_thinking": True
+        }
 
-        for item in market_news[:20]:
-            title = item.get("title", "")
-            summary = item.get("summary", "")
-            url = item.get("url", "")
+    return payload
 
-            if title:
-                market_items.append(
-                    f"- {title}\n"
-                    f"  {summary[:500]}\n"
-                    f"  URL: {url}"
-                )
 
-        if market_items:
-            source_sections.append(
-                "ALPHA VANTAGE MARKET NEWS:\n"
-                + "\n".join(market_items)
-            )
+# ============================================================
+# STEP 5 — NVIDIA MODEL CALL
+# ============================================================
 
-    source_material = "\n\n".join(source_sections)
+def call_nvidia_model(model, prompt):
+    print(f"\n  >>> Trying model: {model}")
 
-    if not source_material:
-        return "Error: No financial news data was collected."
-
-    # Keep the request reasonably sized.
-    source_material = source_material[:50000]
-
-    # --------------------------------------------------------
-    # FINAL ANALYST PROMPT
-    # --------------------------------------------------------
-
-    prompt = f"""
-You are the final analyst for an autonomous daily financial
-intelligence system.
-
-Analyze the collected information below and produce a concise,
-high-quality financial briefing.
-
-IMPORTANT RULES:
-
-- Do not invent facts.
-- Do not fabricate prices, percentages, earnings, dates, or events.
-- Distinguish confirmed information from speculation.
-- Prefer information supported by multiple sources.
-- Identify contradictory reports when relevant.
-- Focus on developments that actually matter.
-- Explain why each major development matters.
-- Do not provide personalized investment advice.
-- Do not tell the reader to buy or sell a specific security.
-
-Use this structure:
-
-# Daily Financial Intelligence Brief
-
-## 🔥 Top Developments
-
-List the 3-5 most important developments.
-
-## 📈 Markets
-
-Cover major market-moving developments.
-
-## 🤖 Technology & AI
-
-Cover important technology, AI, semiconductor, and
-major-company developments.
-
-## 🌎 Macro & Economy
-
-Cover important economic, geopolitical, central-bank,
-inflation, employment, trade, and other macroeconomic
-developments.
-
-## 👀 What To Watch
-
-List important developments to monitor next.
-
-Keep the final answer readable and reasonably concise.
-
-COLLECTED INFORMATION:
-
-{source_material}
-"""
+    payload = model_payload(model, prompt)
 
     try:
-        print("Synthesizing brief with GLM-5.3-Flash...")
-        print("Reasoning effort: MAX")
-
-        completion = nim_client.chat.completions.create(
-            model="z-ai/glm-5-3-flash",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.2,
-            max_tokens=2500,
-            reasoning_effort="max"
+        response = requests.post(
+            NVIDIA_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {NVIDIA_NIM_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
         )
 
-        if not completion.choices:
-            return "Error: GLM-5.3-Flash returned no choices."
+        print(f"      HTTP status: {response.status_code}")
 
-        result = completion.choices[0].message.content
+        if not response.ok:
+            error_body = response.text[:2000]
 
-        if not result:
-            return (
-                "Error: GLM-5.3-Flash returned an empty response."
+            print("      NVIDIA API error:")
+            print(f"      {error_body}")
+
+            raise RuntimeError(
+                f"NVIDIA returned HTTP {response.status_code}: "
+                f"{error_body}"
             )
 
-        return result.strip()
+        data = response.json()
 
-    except Exception as e:
-        print(f"GLM-5.3-Flash error: {e}")
+        text = extract_response_text(data)
 
-        return (
-            "Error: Unable to generate daily summary from "
-            "GLM-5.3-Flash at this time."
+        if not text:
+            raise RuntimeError(
+                "NVIDIA returned a successful response but no text content."
+            )
+
+        print(
+            f"      ✓ {model} succeeded "
+            f"({len(text)} characters)"
+        )
+
+        return text
+
+    except requests.Timeout:
+        raise RuntimeError(
+            f"{model} timed out after {REQUEST_TIMEOUT} seconds."
+        )
+
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"{model} network error: {exc}"
+        )
+
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{model} returned invalid JSON: {exc}"
         )
 
 
+def generate_daily_summary(rss_articles, web_results, market_news):
+    print("\n[5/5] Generating financial intelligence brief...")
+
+    combined_sources = []
+
+    for article in rss_articles:
+        combined_sources.append(
+            {
+                "title": article["title"],
+                "summary": article["summary"],
+                "link": article["link"],
+                "source": "RSS",
+            }
+        )
+
+    for result in web_results:
+        combined_sources.append(result)
+
+    for result in market_news:
+        combined_sources.append(result)
+
+    # Prevent the prompt from becoming unnecessarily enormous.
+    combined_sources = combined_sources[:80]
+
+    source_text_parts = []
+
+    for index, item in enumerate(combined_sources, start=1):
+        source_text_parts.append(
+            f"""
+SOURCE {index}
+Title: {item.get('title', '')}
+Source: {item.get('source', '')}
+Summary: {truncate_text(item.get('summary', ''), 1000)}
+URL: {item.get('link', '')}
+""".strip()
+        )
+
+    source_text = "\n\n".join(source_text_parts)
+
+    prompt = f"""
+Create today's autonomous financial intelligence brief.
+
+Use ONLY the supplied research material as factual grounding.
+
+Analyze:
+
+1. Global financial markets
+2. Stocks and major market movements
+3. AI and technology companies
+4. Semiconductor industry
+5. Macroeconomics
+6. Inflation and interest rates
+7. Central-bank developments
+8. Important risks or opportunities
+9. What deserves attention next
+
+Rules:
+
+- Clearly distinguish facts from interpretation.
+- Do not invent numbers.
+- Do not claim something happened unless the supplied sources support it.
+- If sources disagree, say so.
+- Prefer recent developments.
+- Avoid generic filler.
+- Keep it readable for a human investor/researcher.
+- Use concise headings and bullet points.
+- Include a "Key Takeaways" section.
+- Include a "What To Watch Next" section.
+- Do not provide personalized financial advice.
+- Do not tell the reader to buy or sell a specific security.
+
+Research material:
+
+{source_text}
+"""
+
+    model_order = build_model_order()
+
+    print("\n  MODEL FALLBACK ORDER:")
+
+    for position, model in enumerate(model_order, start=1):
+        print(f"    {position}. {model}")
+
+    failures = []
+
+    for model in model_order:
+        try:
+            summary = call_nvidia_model(model, prompt)
+
+            if summary and len(summary.strip()) >= 100:
+                print(
+                    f"\n  ✓ Daily brief generated successfully "
+                    f"using {model}"
+                )
+
+                return summary.strip(), model
+
+            failure = f"{model}: response was too short"
+            print(f"      ✗ {failure}")
+            failures.append(failure)
+
+        except Exception as exc:
+            failure = f"{model}: {exc}"
+
+            print(f"      ✗ {failure}")
+
+            failures.append(failure)
+
+            # Small delay before moving to the next provider/model.
+            time.sleep(1)
+
+    failure_text = "\n".join(
+        f"  - {failure}"
+        for failure in failures
+    )
+
+    raise RuntimeError(
+        "ALL NVIDIA MODELS FAILED.\n"
+        "The financial brief was not generated.\n\n"
+        f"{failure_text}"
+    )
+
+
 # ============================================================
-# DISCORD DELIVERY
+# DISCORD
 # ============================================================
 
-def send_to_discord(message):
-    """
-    Send the final briefing to Discord.
-
-    Discord messages are limited in length, so large reports
-    are automatically split into chunks.
-    """
-
+def send_to_discord(summary, model_used):
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
 
     if not webhook_url:
-        print("WARNING: DISCORD_WEBHOOK_URL is not configured.")
+        print("DISCORD_WEBHOOK_URL is not configured.")
         return False
 
+    content = (
+        f"**🤖 Autonomous Financial AI Brief**\n"
+        f"*Generated by `{model_used}`*\n\n"
+        f"{summary}"
+    )
+
+    # Discord has a 2000-character message limit.
     chunks = [
-        message[i:i + 1900]
-        for i in range(0, len(message), 1900)
+        content[i:i + 1900]
+        for i in range(0, len(content), 1900)
     ]
 
     try:
@@ -489,15 +763,19 @@ def send_to_discord(message):
                 json={
                     "content": chunk
                 },
-                timeout=15
+                timeout=30,
             )
 
             response.raise_for_status()
 
+            time.sleep(0.5)
+
+        print("✓ Discord delivery successful.")
+
         return True
 
-    except Exception as e:
-        print(f"Discord error: {e}")
+    except Exception as exc:
+        print(f"Discord delivery failed: {exc}")
         return False
 
 
@@ -506,115 +784,81 @@ def send_to_discord(message):
 # ============================================================
 
 def main():
-    print("=" * 60)
+    print("=" * 70)
     print("AUTONOMOUS FINANCIAL AI DISPATCH")
-    print("=" * 60)
+    print("=" * 70)
+
+    start_time = time.time()
 
     # --------------------------------------------------------
     # 1. RSS
     # --------------------------------------------------------
 
-    print("\n[1/5] Collecting RSS news...")
-
-    rss_articles = collect_rss_news()
-
-    print(
-        f"Collected {len(rss_articles)} RSS articles."
-    )
+    rss_articles = collect_rss_articles()
 
     # --------------------------------------------------------
-    # 2. COHERE RESEARCH PLANNING
+    # 2. Cohere autonomous research planning
     # --------------------------------------------------------
 
-    print(
-        "\n[2/5] Generating autonomous research "
-        "queries with Cohere..."
-    )
-
-    queries = autonomous_agent_search()
-
-    print("\nResearch queries:")
-
-    for query in queries:
-        print(f"  - {query}")
+    queries = autonomous_agent_search(rss_articles)
 
     # --------------------------------------------------------
-    # 3. WEB SEARCH
+    # 3. Search
     # --------------------------------------------------------
 
-    print("\n[3/5] Searching the web...")
-
-    search_results = []
-
-    for query in queries:
-        print(f"  Searching: {query}")
-
-        results = search_web(query)
-
-        search_results.extend(results)
-
-        time.sleep(0.5)
-
-    print(
-        f"Collected {len(search_results)} web results."
-    )
+    web_results = collect_serpapi_results(queries)
 
     # --------------------------------------------------------
-    # 4. MARKET NEWS
+    # 4. Market data/news
     # --------------------------------------------------------
 
-    print(
-        "\n[4/5] Collecting Alpha Vantage market news..."
-    )
-
-    market_news = collect_market_news()
-
-    print(
-        f"Collected {len(market_news)} market-news items."
-    )
+    market_news = collect_alpha_vantage_news()
 
     # --------------------------------------------------------
-    # 5. FINAL SYNTHESIS
+    # 5. AI synthesis + fallback ladder
     # --------------------------------------------------------
 
-    print(
-        "\n[5/5] Generating final briefing "
-        "with GLM-5.3-Flash..."
-    )
-
-    print("Reasoning effort: MAX")
-
-    summary = generate_daily_summary(
+    summary, model_used = generate_daily_summary(
         rss_articles=rss_articles,
-        search_results=search_results,
-        market_news=market_news
+        web_results=web_results,
+        market_news=market_news,
     )
 
-    print("\n" + "=" * 60)
-    print("FINAL BRIEF")
-    print("=" * 60)
-
-    print(summary)
-
-    print("=" * 60)
-
     # --------------------------------------------------------
-    # DISCORD
+    # Discord
     # --------------------------------------------------------
 
-    print("\nSending briefing to Discord...")
+    if not send_to_discord(summary, model_used):
+        raise RuntimeError(
+            "The financial brief was generated successfully, "
+            "but Discord delivery failed."
+        )
 
-    if send_to_discord(summary):
-        print("Discord delivery successful.")
-    else:
-        print("Discord delivery failed.")
+    elapsed = time.time() - start_time
 
-    print("\nPipeline complete.")
+    print("\n" + "=" * 70)
+    print("PIPELINE COMPLETE")
+    print(f"Model used: {model_used}")
+    print(f"Runtime: {elapsed:.1f} seconds")
+    print("=" * 70)
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        print("\nPipeline interrupted.")
+        raise
+
+    except Exception as exc:
+        print("\n" + "=" * 70)
+        print("PIPELINE FAILED")
+        print("=" * 70)
+        print(str(exc))
+        print("=" * 70)
+
+        # Important:
+        # Exit non-zero so GitHub Actions correctly marks the run FAILED.
+        raise
+````
