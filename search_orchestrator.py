@@ -6,21 +6,50 @@ from openai import OpenAI
 
 
 # ============================================================
+# CONFIGURATION / SECRET VALIDATION
+# ============================================================
+
+def get_required_secret(name):
+    """
+    Get a required environment variable without ever printing
+    its value.
+    """
+    value = os.getenv(name)
+
+    if not value:
+        raise RuntimeError(
+            f"{name} is missing from the GitHub Actions environment. "
+            f"Add it under GitHub Settings -> Secrets and variables -> Actions."
+        )
+
+    return value
+
+
+# ============================================================
 # API CLIENTS
 # ============================================================
 
 # NVIDIA NIM
-# Used for the final financial briefing with GLM-5.3-Flash.
+# Used for final synthesis with GLM-5.3-Flash.
+NVIDIA_NIM_API_KEY = get_required_secret("NVIDIA_NIM_API_KEY")
+
 nim_client = OpenAI(
     base_url="https://integrate.api.nvidia.com/v1",
-    api_key=os.getenv("NVIDIA_NIM_API_KEY")
+    api_key=NVIDIA_NIM_API_KEY
 )
 
+
 # Cohere OpenAI-compatible API
-# Used for autonomous research/query generation.
+# Used for autonomous research-query generation.
+#
+# IMPORTANT:
+# This does NOT use the Cohere Python SDK.
+# It uses the OpenAI SDK against Cohere's compatibility endpoint.
+COHERE_API_KEY = get_required_secret("COHERE_API_KEY")
+
 cohere_client = OpenAI(
     base_url="https://api.cohere.ai/compatibility/v1",
-    api_key=os.getenv("COHERE_API_KEY")
+    api_key=COHERE_API_KEY
 )
 
 
@@ -75,30 +104,18 @@ def collect_rss_news():
 
 def autonomous_agent_search():
     """
-    Ask Cohere Command A+ to determine which financial/technology
-    topics should be searched next.
+    Ask Cohere Command A+ to determine which three web searches
+    are most useful for the current financial briefing.
 
-    Cohere is accessed through its OpenAI-compatible API, so no
-    separate Cohere SDK is required.
+    Cohere is accessed through its OpenAI-compatible API.
     """
 
-    api_key = os.getenv("COHERE_API_KEY")
-
-    if not api_key:
-        print("WARNING: COHERE_API_KEY is not configured.")
-        print("Using fallback search queries.")
-
-        return [
-            "latest financial market trends",
-            "latest technology and AI stock market news",
-            "latest global economic developments"
-        ]
-
     agent_prompt = """
-You are the autonomous research planner for a daily financial news brief.
+You are the autonomous research planner for a daily financial
+intelligence briefing.
 
 Determine the three most useful web search queries for finding
-important developments in:
+important current developments in:
 
 1. Global financial markets
 2. Technology and AI companies
@@ -114,7 +131,10 @@ Do not use quotation marks.
 
     for attempt in range(3):
         try:
-            print(f"  Asking Cohere for research queries (attempt {attempt + 1}/3)...")
+            print(
+                f"  Asking Cohere for research queries "
+                f"(attempt {attempt + 1}/3)..."
+            )
 
             response = cohere_client.chat.completions.create(
                 model="command-a-plus-05-2026",
@@ -128,34 +148,34 @@ Do not use quotation marks.
                 max_tokens=200
             )
 
+            if not response.choices:
+                raise RuntimeError("Cohere returned no choices.")
+
             content = response.choices[0].message.content
 
             if not content:
-                raise ValueError("Cohere returned empty content.")
+                raise RuntimeError("Cohere returned empty content.")
 
-            queries = [
-                line.strip()
-                for line in content.splitlines()
-                if line.strip()
-            ]
+            # Clean up the response into individual queries.
+            queries = []
 
-            # Remove accidental numbering/bullets.
-            cleaned_queries = []
+            for line in content.splitlines():
+                query = line.strip()
 
-            for query in queries:
+                # Remove common accidental formatting.
                 query = query.lstrip("-•* ")
                 query = query.lstrip("0123456789")
                 query = query.lstrip(". ")
                 query = query.strip()
 
                 if query:
-                    cleaned_queries.append(query)
+                    queries.append(query)
 
-            if len(cleaned_queries) >= 3:
-                return cleaned_queries[:3]
+            if len(queries) >= 3:
+                return queries[:3]
 
-            raise ValueError(
-                f"Cohere returned fewer than 3 usable queries: {cleaned_queries}"
+            raise RuntimeError(
+                f"Cohere returned fewer than three queries: {queries}"
             )
 
         except Exception as e:
@@ -164,7 +184,8 @@ Do not use quotation marks.
             if attempt < 2:
                 time.sleep(2)
 
-    print("Cohere failed after 3 attempts. Using fallback queries.")
+    print("Cohere failed after three attempts.")
+    print("Using fallback research queries.")
 
     return [
         "latest financial market trends",
@@ -225,7 +246,7 @@ def search_web(query):
 
 def collect_market_news():
     """
-    Collect financial/technology news from Alpha Vantage.
+    Collect financial and technology news from Alpha Vantage.
     """
 
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -257,35 +278,34 @@ def collect_market_news():
 
 
 # ============================================================
-# KIMI / GLM REPLACEMENT:
 # GLM-5.3-FLASH FINAL SYNTHESIS
 # ============================================================
 
-def generate_daily_summary(rss_articles, search_results, market_news):
+def generate_daily_summary(
+    rss_articles,
+    search_results,
+    market_news
+):
     """
-    Synthesize all collected information into the final daily brief.
+    Synthesize all collected information into the final briefing
+    using NVIDIA NIM's GLM-5.3-Flash.
 
-    GLM-5.3-Flash is used with MAX reasoning effort.
-
-    NVIDIA documents max as the largest reasoning budget and the
-    default for GLM-5.3-Flash.
+    Maximum reasoning effort is requested.
     """
-
-    if not os.getenv("NVIDIA_NIM_API_KEY"):
-        return "Error: NVIDIA_NIM_API_KEY is not configured."
-
-    # --------------------------------------------------------
-    # Build source material
-    # --------------------------------------------------------
 
     source_sections = []
 
-    # RSS
+    # --------------------------------------------------------
+    # RSS MATERIAL
+    # --------------------------------------------------------
+
     if rss_articles:
         rss_text = "\n".join(
-            f"- {article['title']}\n"
-            f"  {article['summary'][:500]}\n"
-            f"  URL: {article['link']}"
+            (
+                f"- {article['title']}\n"
+                f"  {article['summary'][:500]}\n"
+                f"  URL: {article['link']}"
+            )
             for article in rss_articles[:30]
         )
 
@@ -293,12 +313,17 @@ def generate_daily_summary(rss_articles, search_results, market_news):
             "RSS NEWS:\n" + rss_text
         )
 
-    # Web search
+    # --------------------------------------------------------
+    # WEB SEARCH MATERIAL
+    # --------------------------------------------------------
+
     if search_results:
         web_text = "\n".join(
-            f"- {result['title']}\n"
-            f"  {result['snippet'][:500]}\n"
-            f"  URL: {result['link']}"
+            (
+                f"- {result['title']}\n"
+                f"  {result['snippet'][:500]}\n"
+                f"  URL: {result['link']}"
+            )
             for result in search_results[:30]
         )
 
@@ -306,9 +331,12 @@ def generate_daily_summary(rss_articles, search_results, market_news):
             "WEB SEARCH RESULTS:\n" + web_text
         )
 
-    # Alpha Vantage
+    # --------------------------------------------------------
+    # ALPHA VANTAGE MATERIAL
+    # --------------------------------------------------------
+
     if market_news:
-        market_text_parts = []
+        market_items = []
 
         for item in market_news[:20]:
             title = item.get("title", "")
@@ -316,16 +344,16 @@ def generate_daily_summary(rss_articles, search_results, market_news):
             url = item.get("url", "")
 
             if title:
-                market_text_parts.append(
+                market_items.append(
                     f"- {title}\n"
                     f"  {summary[:500]}\n"
                     f"  URL: {url}"
                 )
 
-        if market_text_parts:
+        if market_items:
             source_sections.append(
                 "ALPHA VANTAGE MARKET NEWS:\n"
-                + "\n".join(market_text_parts)
+                + "\n".join(market_items)
             )
 
     source_material = "\n\n".join(source_sections)
@@ -333,50 +361,58 @@ def generate_daily_summary(rss_articles, search_results, market_news):
     if not source_material:
         return "Error: No financial news data was collected."
 
-    # Prevent accidentally enormous requests.
+    # Keep the request reasonably sized.
     source_material = source_material[:50000]
 
     # --------------------------------------------------------
-    # Final synthesis prompt
+    # FINAL ANALYST PROMPT
     # --------------------------------------------------------
 
     prompt = f"""
-You are the final analyst for an autonomous daily financial intelligence
-system.
+You are the final analyst for an autonomous daily financial
+intelligence system.
 
 Analyze the collected information below and produce a concise,
 high-quality financial briefing.
 
-IMPORTANT:
+IMPORTANT RULES:
+
 - Do not invent facts.
-- Do not make up prices, percentages, earnings, dates, or events.
+- Do not fabricate prices, percentages, earnings, dates, or events.
 - Distinguish confirmed information from speculation.
 - Prefer information supported by multiple sources.
 - Identify contradictory reports when relevant.
 - Focus on developments that actually matter.
 - Explain why each major development matters.
-- Do not give personalized investment advice.
+- Do not provide personalized investment advice.
 - Do not tell the reader to buy or sell a specific security.
 
-Structure the briefing as:
+Use this structure:
 
 # Daily Financial Intelligence Brief
 
 ## 🔥 Top Developments
-3-5 most important developments.
+
+List the 3-5 most important developments.
 
 ## 📈 Markets
-Major market-moving developments.
+
+Cover major market-moving developments.
 
 ## 🤖 Technology & AI
-Important technology, AI, semiconductor, and major-company developments.
+
+Cover important technology, AI, semiconductor, and
+major-company developments.
 
 ## 🌎 Macro & Economy
-Important economic, geopolitical, central-bank, inflation, employment,
-trade, or other macroeconomic developments.
+
+Cover important economic, geopolitical, central-bank,
+inflation, employment, trade, and other macroeconomic
+developments.
 
 ## 👀 What To Watch
-Important developments to monitor next.
+
+List important developments to monitor next.
 
 Keep the final answer readable and reasonably concise.
 
@@ -387,6 +423,7 @@ COLLECTED INFORMATION:
 
     try:
         print("Synthesizing brief with GLM-5.3-Flash...")
+        print("Reasoning effort: MAX")
 
         completion = nim_client.chat.completions.create(
             model="z-ai/glm-5-3-flash",
@@ -401,28 +438,37 @@ COLLECTED INFORMATION:
             reasoning_effort="max"
         )
 
+        if not completion.choices:
+            return "Error: GLM-5.3-Flash returned no choices."
+
         result = completion.choices[0].message.content
 
         if not result:
-            return "Error: GLM-5.3-Flash returned an empty response."
+            return (
+                "Error: GLM-5.3-Flash returned an empty response."
+            )
 
         return result.strip()
 
     except Exception as e:
         print(f"GLM-5.3-Flash error: {e}")
-        return "Error: Unable to generate daily summary from GLM-5.3-Flash at this time."
+
+        return (
+            "Error: Unable to generate daily summary from "
+            "GLM-5.3-Flash at this time."
+        )
 
 
 # ============================================================
-# DISCORD
+# DISCORD DELIVERY
 # ============================================================
 
 def send_to_discord(message):
     """
     Send the final briefing to Discord.
 
-    Discord webhooks have a message length limit, so long reports
-    are split into multiple messages.
+    Discord messages are limited in length, so large reports
+    are automatically split into chunks.
     """
 
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
@@ -469,22 +515,31 @@ def main():
     # --------------------------------------------------------
 
     print("\n[1/5] Collecting RSS news...")
+
     rss_articles = collect_rss_news()
-    print(f"Collected {len(rss_articles)} RSS articles.")
+
+    print(
+        f"Collected {len(rss_articles)} RSS articles."
+    )
 
     # --------------------------------------------------------
-    # 2. Cohere research planning
+    # 2. COHERE RESEARCH PLANNING
     # --------------------------------------------------------
 
-    print("\n[2/5] Generating autonomous research queries with Cohere...")
+    print(
+        "\n[2/5] Generating autonomous research "
+        "queries with Cohere..."
+    )
+
     queries = autonomous_agent_search()
 
-    print("Research queries:")
+    print("\nResearch queries:")
+
     for query in queries:
         print(f"  - {query}")
 
     # --------------------------------------------------------
-    # 3. Web research
+    # 3. WEB SEARCH
     # --------------------------------------------------------
 
     print("\n[3/5] Searching the web...")
@@ -495,28 +550,38 @@ def main():
         print(f"  Searching: {query}")
 
         results = search_web(query)
+
         search_results.extend(results)
 
-        # Small delay to avoid unnecessarily hammering APIs.
         time.sleep(0.5)
 
-    print(f"Collected {len(search_results)} web results.")
+    print(
+        f"Collected {len(search_results)} web results."
+    )
 
     # --------------------------------------------------------
-    # 4. Market data
+    # 4. MARKET NEWS
     # --------------------------------------------------------
 
-    print("\n[4/5] Collecting Alpha Vantage market news...")
+    print(
+        "\n[4/5] Collecting Alpha Vantage market news..."
+    )
 
     market_news = collect_market_news()
 
-    print(f"Collected {len(market_news)} market-news items.")
+    print(
+        f"Collected {len(market_news)} market-news items."
+    )
 
     # --------------------------------------------------------
-    # 5. Final synthesis
+    # 5. FINAL SYNTHESIS
     # --------------------------------------------------------
 
-    print("\n[5/5] Generating final briefing with GLM-5.3-Flash...")
+    print(
+        "\n[5/5] Generating final briefing "
+        "with GLM-5.3-Flash..."
+    )
+
     print("Reasoning effort: MAX")
 
     summary = generate_daily_summary(
@@ -528,11 +593,13 @@ def main():
     print("\n" + "=" * 60)
     print("FINAL BRIEF")
     print("=" * 60)
+
     print(summary)
+
     print("=" * 60)
 
     # --------------------------------------------------------
-    # Discord
+    # DISCORD
     # --------------------------------------------------------
 
     print("\nSending briefing to Discord...")
