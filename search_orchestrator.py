@@ -1,6 +1,5 @@
 import os
 import json
-import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -13,37 +12,32 @@ from openai import OpenAI
 # CONFIG
 # ============================================================
 
-NVIDIA_CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
-# 30 seconds is the TOTAL request timeout.
-# This is intentionally aggressive because this pipeline
-# does not need deep reasoning.
+# This is the TOTAL timeout for each Cohere request.
 REQUEST_TIMEOUT = 30
 
 MAX_WORKERS = 24
 
 COHERE_QUERY_MODEL = "command-a-plus-05-2026"
 
-
-# ============================================================
-# NVIDIA MODEL FALLBACK LADDER
-# ============================================================
-
-PRIMARY_MODELS = [
-    "z-ai/glm-5-3-flash",
-    "z-ai/glm-5-3",
+# Active Cohere chat/generation models with English support, ordered
+# from strongest general-purpose models to smaller fallbacks.
+# Specialized translation, transcription, embedding, reranking,
+# parsing, and Arabic-specialized models are not text-generation
+# substitutes for this financial research workflow.
+COHERE_MODEL_FALLBACK_ORDER = [
+    "command-a-plus-05-2026",
+    "command-a-reasoning-08-2025",
+    "command-a-03-2025",
+    "command-a-vision-07-2025",
+    "command-r-plus-08-2024",
+    "command-r-08-2024",
+    "c4ai-aya-expanse-32b",
+    "command-r7b-12-2024",
+    "c4ai-aya-vision-32b",
+    "tiny-aya-global",
+    "tiny-aya-fire",
+    "tiny-aya-water",
 ]
-
-FALLBACK_MODELS = [
-    "deepseek-ai/deepseek-v4.1-flash",
-    "moonshotai/kimi-k3",
-    "nvidia/nemotron-3-ultra-550b-a55b",
-    "google/gemma-4-31b-it",
-    "nvidia/nemotron-3-super-120b-a12b",
-    "openai/gpt-oss-20b",
-]
-
-DUMBEST_LAST_MODEL = "openai/gpt-oss-20b"
 
 
 # ============================================================
@@ -88,10 +82,6 @@ def get_required_secret(name):
     return value
 
 
-NVIDIA_NIM_API_KEY = get_required_secret(
-    "NVIDIA_NIM_API_KEY"
-)
-
 COHERE_API_KEY = get_required_secret(
     "COHERE_API_KEY"
 )
@@ -104,6 +94,8 @@ COHERE_API_KEY = get_required_secret(
 cohere_client = OpenAI(
     base_url="https://api.cohere.ai/compatibility/v1",
     api_key=COHERE_API_KEY,
+    timeout=REQUEST_TIMEOUT,
+    max_retries=0,
 )
 
 
@@ -153,95 +145,6 @@ def truncate_text(value, max_chars):
     )
 
 
-# ============================================================
-# GENERIC RESPONSE EXTRACTION
-# ============================================================
-
-def extract_response_text(data):
-    """
-    Handles several OpenAI-compatible response formats.
-
-    Some reasoning models may expose:
-        message.content
-
-Others may return content as blocks.
-
-We deliberately do NOT use reasoning_content as the final
-answer because internal reasoning is not the financial brief.
-"""
-
-    if not isinstance(data, dict):
-        return ""
-
-    choices = data.get("choices")
-
-    if not isinstance(choices, list) or not choices:
-        return ""
-
-    choice = choices[0]
-
-    if not isinstance(choice, dict):
-        return ""
-
-    message = choice.get("message")
-
-    if isinstance(message, dict):
-
-        content = message.get("content")
-
-        # Normal OpenAI-compatible response.
-        if isinstance(content, str):
-            return content.strip()
-
-        # Some APIs return content blocks.
-        if isinstance(content, list):
-
-            pieces = []
-
-            for item in content:
-
-                if isinstance(item, str):
-                    pieces.append(item)
-
-                elif isinstance(item, dict):
-
-                    text = item.get("text")
-
-                    if isinstance(text, str):
-                        pieces.append(text)
-
-            result = "\n".join(
-                piece for piece in pieces
-                if piece
-            ).strip()
-
-            if result:
-                return result
-
-        # Some providers may put the generated text here.
-        for key in (
-            "output_text",
-            "text",
-        ):
-            value = message.get(key)
-
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-    # Last-resort top-level fields.
-    for key in (
-        "output_text",
-        "text",
-    ):
-        value = choice.get(key)
-
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-
-    return ""
-
-
-# ============================================================
 # RSS
 # ============================================================
 
@@ -945,279 +848,68 @@ def collect_alpha_vantage_news():
 # ============================================================
 
 def build_model_order():
-
-    randomized = [
-        model
-        for model in FALLBACK_MODELS
-        if model != DUMBEST_LAST_MODEL
-    ]
-
-    random.shuffle(
-        randomized
-    )
-
-    return (
-        PRIMARY_MODELS
-        + randomized
-        + [
-            DUMBEST_LAST_MODEL
-        ]
-    )
+    """Return Cohere's supported English-capable chat models in fixed order."""
+    return list(COHERE_MODEL_FALLBACK_ORDER)
 
 
 # ============================================================
-# MODEL PAYLOAD
+# COHERE MODEL CALL
 # ============================================================
 
-def model_payload(
+def call_cohere_model(
     model,
     prompt,
 ):
-
-    payload = {
-        "model": model,
-
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert financial "
-                    "research analyst. "
-                    "Produce accurate, concise, "
-                    "evidence-grounded analysis. "
-                    "Do not invent facts, prices, "
-                    "events, or sources."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-
-        "temperature": 0.2,
-        "top_p": 0.95,
-
-        # We do not need a huge answer.
-        "max_tokens": 1800,
-
-        "stream": False,
-    }
-
-
-    # --------------------------------------------------------
-    # DISABLE / MINIMIZE THINKING
-    # --------------------------------------------------------
-
-    if model in {
-        "z-ai/glm-5-3-flash",
-        "z-ai/glm-5-3",
-    }:
-
-        # GLM's minimum reasoning level.
-        payload[
-            "reasoning_effort"
-        ] = "low"
-
-
-    elif model == (
-        "deepseek-ai/"
-        "deepseek-v4.1-flash"
-    ):
-
-        payload[
-            "reasoning_effort"
-        ] = "none"
-
-
-    elif model in {
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "nvidia/nemotron-3-super-120b-a12b",
-    }:
-
-        payload[
-            "chat_template_kwargs"
-        ] = {
-            "enable_thinking": False,
-            "force_nonempty_content": True,
-        }
-
-
-    # --------------------------------------------------------
-    # GPT-OSS / OTHER NON-THINKING MODELS
-    # --------------------------------------------------------
-    #
-    # We deliberately do not add reasoning parameters to
-    # models that do not need them.
-
-    return payload
-
-
-# ============================================================
-# NVIDIA CALL
-# ============================================================
-
-def call_nvidia_model(
-    model,
-    prompt,
-):
-
     print(
-        f"\n  >>> Trying model: {model}",
+        f"\n  >>> Trying Cohere model: {model}",
         flush=True,
-    )
-
-    payload = model_payload(
-        model,
-        prompt,
     )
 
     started = time.time()
 
     try:
-
-        response = requests.post(
-            NVIDIA_CHAT_URL,
-
-            headers={
-                "Authorization": (
-                    f"Bearer "
-                    f"{NVIDIA_NIM_API_KEY}"
-                ),
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-
-            json=payload,
-
-            timeout=REQUEST_TIMEOUT,
+        response = cohere_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert financial research analyst. "
+                        "Produce accurate, concise, evidence-grounded analysis. "
+                        "Do not invent facts, prices, events, or sources."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0.2,
+            top_p=0.95,
+            max_tokens=1800,
         )
 
-        elapsed = (
-            time.time()
-            - started
-        )
+        elapsed = time.time() - started
+        answer = extract_cohere_content(response)
 
-        print(
-            f"      HTTP status: "
-            f"{response.status_code} "
-            f"({elapsed:.2f}s)",
-            flush=True,
-        )
-
-        if not response.ok:
-
-            error_body = (
-                response.text[:2000]
-            )
-
-            print(
-                "      NVIDIA API error:",
-                flush=True,
-            )
-
-            print(
-                error_body,
-                flush=True,
-            )
-
+        if not answer:
             raise RuntimeError(
-                "NVIDIA returned HTTP "
-                f"{response.status_code}: "
-                f"{error_body}"
-            )
-
-        try:
-
-            data = response.json()
-
-        except ValueError as exc:
-
-            raise RuntimeError(
-                "NVIDIA returned invalid JSON: "
-                f"{exc}"
-            )
-
-        text = extract_response_text(
-            data
-        )
-
-        if not text:
-
-            # THIS IS IMPORTANT.
-            # Instead of silently moving on,
-            # show the response structure.
-            print(
-                "      ⚠ HTTP 200 but no "
-                "extractable text.",
-                flush=True,
-            )
-
-            print(
-                "      Response keys: "
-                f"{list(data.keys())}",
-                flush=True,
-            )
-
-            if isinstance(
-                data.get("choices"),
-                list,
-            ) and data["choices"]:
-
-                choice = data[
-                    "choices"
-                ][0]
-
-                print(
-                    "      Choice keys: "
-                    f"{list(choice.keys())}",
-                    flush=True,
-                )
-
-                message = choice.get(
-                    "message"
-                )
-
-                if isinstance(
-                    message,
-                    dict,
-                ):
-
-                    print(
-                        "      Message keys: "
-                        f"{list(message.keys())}",
-                        flush=True,
-                    )
-
-            raise RuntimeError(
-                "NVIDIA returned a successful "
-                "response but no text content."
+                "Cohere returned a successful response but no text content."
             )
 
         print(
             f"      ✓ {model} succeeded "
-            f"({len(text)} chars, "
-            f"{elapsed:.2f}s)",
+            f"({len(answer)} chars, {elapsed:.2f}s)",
             flush=True,
         )
 
-        return text
+        return answer
 
-
-    except requests.Timeout:
-
+    except Exception as exc:
+        elapsed = time.time() - started
         raise RuntimeError(
-            f"{model} timed out after "
-            f"{REQUEST_TIMEOUT} seconds."
-        )
-
-
-    except requests.RequestException as exc:
-
-        raise RuntimeError(
-            f"{model} network error: "
-            f"{exc}"
-        )
+            f"{model} failed after {elapsed:.2f}s: {exc}"
+        ) from exc
 
 
 # ============================================================
@@ -1360,7 +1052,7 @@ Research material:
 
         try:
 
-            summary = call_nvidia_model(
+            summary = call_cohere_model(
                 model,
                 prompt,
             )
@@ -1422,7 +1114,7 @@ Research material:
 
 
     raise RuntimeError(
-        "ALL NVIDIA MODELS FAILED.\n"
+        "ALL COHERE MODELS FAILED.\n"
         "The financial brief was not generated.\n\n"
         f"{failure_text}"
     )
@@ -1583,7 +1275,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # 5. NVIDIA
+    # 5. COHERE
     # --------------------------------------------------------
 
     summary, model_used = (
