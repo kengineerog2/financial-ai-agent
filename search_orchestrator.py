@@ -35,6 +35,8 @@ COHERE_MODEL_FALLBACK_ORDER = [
     "command-r7b-12-2024",
     "c4ai-aya-vision-32b",
     "tiny-aya-global",
+    "tiny-aya-fire",
+    "tiny-aya-water",
 ]
 
 
